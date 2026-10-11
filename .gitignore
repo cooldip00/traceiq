@@ -31,3 +31,11 @@ Thumbs.db
 # Local config / secrets
 .env.local
 config.local.yaml
+
+# Personal files kept next to the project (never publish)
+*.pdf
+*.docx
+mermaid-diagram-*.png
+
+# Test cache
+.pytest_cache/

@@ -5,9 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TraceIQ — PDM Traceability Agent</title>
   <meta name="description" content="Local-first AI-powered document traceability agent for PDM workflows. Detects conflicts across BRD, PRD, SDD, Epics, and User Stories." />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -192,6 +189,7 @@
       </div>
 
       <p class="report-summary" id="report-summary"></p>
+      <div class="ai-notice" id="ai-notice" style="display:none;"></div>
 
       <div class="report-tabs">
         <button class="tab-btn active" id="tab-conflicts" onclick="showTab('conflicts')">
@@ -200,16 +198,20 @@
         <button class="tab-btn" id="tab-warnings" onclick="showTab('warnings')">
           🟡 Warnings
         </button>
+        <button class="tab-btn" id="tab-impact" onclick="showTab('impact')">
+          🔗 Change Impact
+        </button>
       </div>
 
       <div class="report-content" id="report-conflicts"></div>
       <div class="report-content" id="report-warnings" style="display:none;"></div>
+      <div class="report-content" id="report-impact" style="display:none;"></div>
     </section>
 
   </main>
 
   <footer class="footer">
-    <span>TraceIQ v1.0 · Powered by Qwen 2.5 7B · All analysis runs locally · No data leaves your machine</span>
+    <span>TraceIQ v1.1 · Powered by Qwen 2.5 7B · All analysis runs locally · No data leaves your machine</span>
   </footer>
 
   <script src="/static/app.js"></script>

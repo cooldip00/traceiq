@@ -1,24 +1,51 @@
 import asyncio
 import json
+import logging
+import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.orchestrator import run_pipeline
 from backend.models import AnalysisReport
 
-app = FastAPI(title="TraceIQ — PDM Traceability Agent", version="1.0.0")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="TraceIQ — PDM Traceability Agent", version="1.1.0")
+
+MAX_FILES = 100
+MAX_FILE_BYTES = 1_000_000      # 1 MB per markdown file
+JOB_TTL_SECONDS = 60 * 60       # forget jobs after 1 hour
+KEEPALIVE_SECONDS = 15          # SSE comment ping while waiting for events
+
 
 # ── In-memory job store ───────────────────────────────────────────────────────
-# job_id → asyncio.Queue of StepEvent dicts (None = done)
-job_queues: dict[str, asyncio.Queue] = {}
-# job_id → final AnalysisReport
-job_reports: dict[str, AnalysisReport] = {}
+# Fine for a single local process. A multi-worker deployment would need a
+# shared store (e.g. Redis) because each worker has its own memory.
+@dataclass
+class Job:
+    queue: asyncio.Queue = field(default_factory=asyncio.Queue)  # StepEvent dicts, None = done
+    report: AnalysisReport | None = None
+    created_at: float = field(default_factory=time.monotonic)
+
+
+jobs: dict[str, Job] = {}
+# Strong references to running pipelines; the event loop only keeps weak
+# references, so an unreferenced task could be garbage-collected mid-run.
+background_tasks: set[asyncio.Task] = set()
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+
+
+def _purge_old_jobs() -> None:
+    cutoff = time.monotonic() - JOB_TTL_SECONDS
+    for job_id in [j for j, job in jobs.items() if job.created_at < cutoff]:
+        del jobs[job_id]
 
 
 # ── Static files ──────────────────────────────────────────────────────────────
@@ -36,23 +63,33 @@ async def index():
 async def analyze(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
+    if len(files) > MAX_FILES:
+        raise HTTPException(status_code=400, detail=f"Too many files (max {MAX_FILES}).")
 
     # Read all file contents up front (can't read UploadFile in a thread)
     file_contents: list[tuple[str, str]] = []
     for f in files:
-        content = await f.read()
-        file_contents.append((f.filename, content.decode("utf-8")))
+        name = f.filename or "unnamed"
+        if not name.lower().endswith(".md"):
+            raise HTTPException(status_code=400, detail=f"'{name}' is not a .md file.")
+        raw = await f.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            raise HTTPException(status_code=400, detail=f"'{name}' is larger than {MAX_FILE_BYTES // 1000} KB.")
+        try:
+            file_contents.append((name, raw.decode("utf-8-sig")))  # -sig strips a BOM
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail=f"'{name}' is not valid UTF-8 text.")
 
-    job_id = str(uuid.uuid4())[:8]
-    queue: asyncio.Queue = asyncio.Queue()
-    job_queues[job_id] = queue
+    _purge_old_jobs()
+    job_id = uuid.uuid4().hex[:8]
+    job = jobs[job_id] = Job()
 
-    # Run pipeline as background task
-    async def _run():
-        report = await run_pipeline(job_id, file_contents, queue)
-        job_reports[job_id] = report
+    def store_report(report: AnalysisReport) -> None:
+        job.report = report
 
-    asyncio.create_task(_run())
+    task = asyncio.create_task(run_pipeline(job_id, file_contents, job.queue, on_report=store_report))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
     return {"job_id": job_id}
 
@@ -60,22 +97,24 @@ async def analyze(files: list[UploadFile] = File(...)):
 # ── SSE stream endpoint ────────────────────────────────────────────────────────
 @app.get("/stream/{job_id}")
 async def stream_events(job_id: str):
-    if job_id not in job_queues:
+    if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found.")
-
-    queue = job_queues[job_id]
+    job = jobs[job_id]
 
     async def event_generator():
-        try:
-            while True:
-                event = await asyncio.wait_for(queue.get(), timeout=180.0)
-                if event is None:
-                    # Pipeline done — send final sentinel event
-                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                    break
-                yield f"data: {json.dumps(event)}\n\n"
-        except asyncio.TimeoutError:
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Analysis timed out'})}\n\n"
+        while True:
+            try:
+                event = await asyncio.wait_for(job.queue.get(), timeout=KEEPALIVE_SECONDS)
+            except asyncio.TimeoutError:
+                # Nothing new (e.g. a slow AI call). A comment line keeps the
+                # connection alive; EventSource ignores it.
+                yield ": keepalive\n\n"
+                continue
+            if event is None:
+                # Pipeline finished (successfully or not)
+                yield f"data: {json.dumps({'type': 'done', 'report_ready': job.report is not None})}\n\n"
+                break
+            yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -91,9 +130,10 @@ async def stream_events(job_id: str):
 # ── Final report endpoint ──────────────────────────────────────────────────────
 @app.get("/report/{job_id}")
 async def get_report(job_id: str):
-    if job_id not in job_reports:
+    job = jobs.get(job_id)
+    if job is None or job.report is None:
         raise HTTPException(status_code=404, detail="Report not ready yet.")
-    return job_reports[job_id].model_dump()
+    return job.report.model_dump()
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
