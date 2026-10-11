@@ -1,3 +1,4 @@
+import uuid
 from pydantic import BaseModel, Field
 from typing import Optional
 from enum import Enum
@@ -51,12 +52,14 @@ class IssueSeverity(str, Enum):
 
 class IssueType(str, Enum):
     SEMANTIC_CONFLICT = "SEMANTIC_CONFLICT"
-    MISSING_LINK = "MISSING_LINK"
+    PARTIAL_MATCH = "PARTIAL_MATCH"
     ORPHANED_REQUIREMENT = "ORPHANED_REQUIREMENT"
     MISSING_ACCEPTANCE_CRITERIA = "MISSING_ACCEPTANCE_CRITERIA"
     BROKEN_REFERENCE = "BROKEN_REFERENCE"
     VERSION_MISMATCH = "VERSION_MISMATCH"
     COVERAGE_GAP = "COVERAGE_GAP"
+    CIRCULAR_TRACE = "CIRCULAR_TRACE"
+    PARSE_ERROR = "PARSE_ERROR"
 
 
 class Issue(BaseModel):
@@ -73,6 +76,26 @@ class Issue(BaseModel):
     confidence: Optional[float] = None
 
 
+def make_issue(
+    issue_type: IssueType,
+    severity: IssueSeverity,
+    source_doc: str,
+    title: str,
+    description: str,
+    **fields,
+) -> Issue:
+    """Shared Issue factory used by the parser, validator and analyzer."""
+    return Issue(
+        issue_id=uuid.uuid4().hex[:8],
+        issue_type=issue_type,
+        severity=severity,
+        source_doc=source_doc,
+        title=title,
+        description=description,
+        **fields,
+    )
+
+
 class StepEvent(BaseModel):
     step: int
     name: str
@@ -81,12 +104,23 @@ class StepEvent(BaseModel):
     data: dict = Field(default_factory=dict)
 
 
+class AIStatus(str, Enum):
+    OK = "ok"                    # every pair got a verdict
+    PARTIAL = "partial"          # some pairs failed (timeout, bad JSON, ...)
+    UNAVAILABLE = "unavailable"  # Ollama/model not reachable, AI step skipped
+    NO_PAIRS = "no_pairs"        # nothing to analyze
+
+
 class AnalysisReport(BaseModel):
     job_id: str
     total_documents: int
     total_requirements: int
     total_links: int
-    conflicts: list[Issue] = Field(default_factory=list)
-    warnings: list[Issue] = Field(default_factory=list)
-    ok_count: int = 0
+    conflicts: list[Issue] = Field(default_factory=list)   # severity HIGH
+    warnings: list[Issue] = Field(default_factory=list)    # severity MEDIUM / LOW
+    ok_count: int = 0          # AI-checked pairs judged CONSISTENT
+    pairs_total: int = 0
+    pairs_failed: int = 0
+    ai_status: AIStatus = AIStatus.NO_PAIRS
     summary: str = ""
+    impact_map: dict = Field(default_factory=dict)

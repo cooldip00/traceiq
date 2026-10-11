@@ -40,8 +40,9 @@
   --shadow-card:    0 4px 24px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.04) inset;
   --shadow-glow:    0 0 40px rgba(99, 102, 241, 0.15);
 
-  --font-main:      'Inter', -apple-system, sans-serif;
-  --font-mono:      'JetBrains Mono', 'Cascadia Code', monospace;
+  /* System fonts only: the app makes no external requests */
+  --font-main:      'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:      'Cascadia Code', Consolas, 'SFMono-Regular', Menlo, monospace;
 
   --transition:     0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -618,7 +619,9 @@ body {
 }
 
 .issue-type-badge.SEMANTIC_CONFLICT { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border); }
-.issue-type-badge.MISSING_LINK { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }
+.issue-type-badge.PARTIAL_MATCH { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }
+.issue-type-badge.CIRCULAR_TRACE { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }
+.issue-type-badge.PARSE_ERROR { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border); }
 .issue-type-badge.ORPHANED_REQUIREMENT { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }
 .issue-type-badge.MISSING_ACCEPTANCE_CRITERIA { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning-border); }
 .issue-type-badge.BROKEN_REFERENCE { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger-border); }
@@ -721,3 +724,27 @@ body {
 @media (max-width: 900px) {
   .top-grid { grid-template-columns: 1fr; }
 }
+
+/* ── AI STATUS NOTICE ──────────────────────────────────────────────────── */
+.ai-notice {
+  margin: -4px 0 16px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  color: var(--warning);
+  font-size: 13px;
+}
+
+/* ── CHANGE IMPACT TABLE ───────────────────────────────────────────────── */
+.impact-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.impact-table th, .impact-table td {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.impact-table th { color: var(--text-secondary); font-weight: 600; }
+.impact-table td:first-child { font-family: var(--font-mono); white-space: nowrap; }
+.impact-table .impact-count { color: var(--accent-light); font-weight: 600; }
+.impact-table .impact-docs { color: var(--text-secondary); font-family: var(--font-mono); font-size: 12px; }

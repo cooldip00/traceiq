@@ -24,9 +24,9 @@ Upload your PDM documents. TraceIQ runs a 5-step pipeline that:
 
 1. **Parses** all markdown documents and extracts structured requirements
 2. **Builds** a directed traceability graph (NetworkX) across the full document chain
-3. **Validates** structural integrity — broken links, missing coverage, version mismatches, requirements with no acceptance criteria
-4. **Analyzes** semantically linked requirement pairs using a local Qwen 2.5 7B model — detecting contradictions, scope drift, and SLA mismatches
-5. **Generates** a classified conflict report streamed live to the browser via Server-Sent Events
+3. **Validates** structural integrity — broken links, requirement-level coverage gaps, version mismatches, requirements with no acceptance criteria
+4. **Analyzes** every traced requirement pair using a local Qwen 2.5 7B model — detecting contradictions, scope drift, and SLA mismatches
+5. **Generates** a classified conflict report plus a change-impact table, streamed live to the browser via Server-Sent Events
 
 All inference runs on local GPU via Ollama. **No API keys. No cloud. No data exposure.**
 
@@ -54,11 +54,31 @@ ADD (Architecture Assess)                          ▼
 | Type | Detected By | Example |
 |---|---|---|
 | Semantic contradiction | Qwen 2.5 7B | BRD: "email within 2 min" vs US: "within 60 min" |
-| Missing downstream link | Python | PRD feature with no Epic |
-| Orphaned requirement | Python | Epic linking to non-existent PRD |
+| Partial match | Qwen 2.5 7B | Downstream requirement narrower than upstream |
+| Orphaned requirement | Python (graph) | PRD feature that no Epic traces to |
+| Coverage gap | Python (graph) | BRD requirement with no CDD or PRD requirement tracing to it |
+| Missing downstream document | Python (graph) | BRD that links to no PRD |
+| Broken reference | Python (graph) | Trace to `BRD-009/R-01`, which was never uploaded |
+| Version mismatch | Python | Any document "written against BRD v1.0" when BRD is v1.2 |
 | No acceptance criteria | Python | User Story with untestable requirement |
-| Version mismatch | Python | SDD written against outdated BRD version |
-| Coverage gap | Python + AI | BRD requirement not addressed in CDD |
+| Parse error | Python | Unknown `doc_type`, duplicate `doc_id`, malformed `### Req-01` header |
+
+If Ollama is not running, the report says so explicitly: structural checks still run, and the
+AI pairs are reported as **not checked** rather than silently treated as consistent.
+
+### How the graph works
+
+Every document and requirement is a node. Every `links_to` / `traces_to` edge is stored pointing
+**upstream → downstream** using the chain rank (LVC → TIA → BRD → CDD → PRD → SDD → ADD → EPIC → USER_STORY),
+whichever document declared it. The graph is therefore acyclic, so:
+
+- **descendants** of a document = what may be stale when it changes (Change Impact tab)
+- **ancestors** = what it depends on
+- a trace declared by both sides becomes one edge, so each pair is sent to the AI once
+
+Trade-off: after the PRD the real process forks into a design branch (SDD → ADD) and a delivery
+branch (EPIC → USER_STORY); a single rank line treats them as one chain. Same-rank links keep the
+author's direction, and any resulting cycle is reported.
 
 ---
 
@@ -115,6 +135,13 @@ python -m uvicorn backend.main:app --reload --port 8000
 
 Open **http://localhost:8000** in your browser.
 
+### 4. Tests
+```bash
+pip install -r requirements-dev.txt
+python -m pytest            # fast, no Ollama needed (the model is mocked)
+python -m tests.eval_ai     # precision/recall of the real model on labelled pairs (needs Ollama)
+```
+
 ---
 
 ## Usage
@@ -122,11 +149,19 @@ Open **http://localhost:8000** in your browser.
 1. Upload your PDM documents as `.md` files (drag & drop or browse)
 2. Click **Run Traceability Analysis**
 3. Watch the 5-step pipeline stream live in the browser
-4. Review the conflict report — 🔴 Conflicts, 🟡 Warnings, 🟢 Consistent
+4. Review the report — 🔴 Conflicts (HIGH severity), 🟡 Warnings (MEDIUM/LOW), 🟢 AI-checked pairs found consistent, and 🔗 Change Impact
 
 ### Sample Documents
 
-The `sample_docs/` directory contains a complete fictional **Customer Loyalty Program** initiative across all 9 document types, with 5 pre-seeded conflicts including a semantic SLA mismatch detected by the AI.
+The `sample_docs/` directory contains a complete fictional **Customer Loyalty Program** initiative across all 9 document types, with 5 pre-seeded conflicts:
+
+| Seeded conflict | Detected by |
+|---|---|
+| BRD R-03 (email in 2 min) vs US-002 AC-04 (60 min) | AI |
+| BRD R-07 not covered by any CDD requirement | Requirement coverage check |
+| PRD F-04 has no Epic | Requirement coverage check |
+| SDD written against BRD v1.0 (current v1.2) | Version check |
+| US-004 has no acceptance criteria | Acceptance criteria check |
 
 ```bash
 # Upload everything in sample_docs/confluence/ and sample_docs/jira/
@@ -209,7 +244,9 @@ pdm-traceability-agent/
 ├── sample_docs/
 │   ├── confluence/       # LVC, TIA, BRD, CDD, PRD, SDD, ADD
 │   └── jira/             # Epics, User Stories
-└── requirements.txt
+├── tests/                # pytest suite + eval_ai.py (model accuracy)
+├── requirements.txt
+└── requirements-dev.txt
 ```
 
 ---

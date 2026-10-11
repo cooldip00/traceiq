@@ -1,10 +1,10 @@
-import uuid
+import re
 import networkx as nx
 from backend.models import (
-    ParsedDocument, Issue, IssueType, IssueSeverity, DocType
+    ParsedDocument, Requirement, Issue, IssueType, IssueSeverity, DocType, make_issue,
 )
 
-# Documents that MUST have downstream links
+# Document types that MUST have a direct downstream document link
 REQUIRED_LINKS = {
     DocType.LVC: [DocType.BRD, DocType.TIA],
     DocType.BRD: [DocType.CDD, DocType.PRD],
@@ -13,28 +13,37 @@ REQUIRED_LINKS = {
     DocType.EPIC: [DocType.USER_STORY],
 }
 
+# Requirements of type X that MUST be traced by at least one requirement of
+# each downstream type: (downstream type, issue type, severity, consequence)
+REQUIRED_TRACE_COVERAGE = {
+    DocType.BRD: [
+        (DocType.CDD, IssueType.COVERAGE_GAP, IssueSeverity.MEDIUM,
+         "This business requirement has no concept design."),
+        (DocType.PRD, IssueType.COVERAGE_GAP, IssueSeverity.HIGH,
+         "This business requirement is not specified as a product feature."),
+    ],
+    DocType.PRD: [
+        (DocType.EPIC, IssueType.ORPHANED_REQUIREMENT, IssueSeverity.HIGH,
+         "This feature will not be tracked or delivered."),
+    ],
+}
 
-def _make_issue(
-    issue_type: IssueType,
-    severity: IssueSeverity,
-    source_doc: str,
-    title: str,
-    description: str,
-    source_req: str = None,
-    target_doc: str = None,
-    target_req: str = None,
-) -> Issue:
-    return Issue(
-        issue_id=str(uuid.uuid4())[:8],
-        issue_type=issue_type,
-        severity=severity,
-        source_doc=source_doc,
-        source_req=source_req,
-        target_doc=target_doc,
-        target_req=target_req,
-        title=title,
-        description=description,
-    )
+# "BRD v1.0", "BRD-001 v1.2", "SDD-v2.0"
+VERSION_REF = re.compile(r"\b([A-Z][A-Z_]*(?:-\d+)?)[ -]v(\d+(?:\.\d+)+)\b")
+DOC_TYPE_NAMES = {t.value for t in DocType}
+
+
+def _version_key(v: str) -> tuple:
+    return tuple(int(p) if p.isdigit() else p for p in re.split(r"[.\-]", v.strip()))
+
+
+def _downstream_doc_types(G: nx.DiGraph, node: str, edge_type: str) -> set[str]:
+    """Doc types of the direct downstream neighbours of `node` via `edge_type`."""
+    return {
+        G.nodes[v].get("doc_type")
+        for v in G.successors(node)
+        if G.edges[node, v].get("edge_type") == edge_type
+    }
 
 
 def validate_structural(
@@ -43,17 +52,21 @@ def validate_structural(
 ) -> list[Issue]:
     """
     Run purely deterministic structural checks. No AI involved.
+    Expects G from build_graph (edges point upstream → downstream).
     Returns a list of Issue objects.
     """
     issues: list[Issue] = []
     doc_map = {doc.doc_id: doc for doc in documents}
-    all_doc_ids = set(doc_map.keys())
+    uploaded_types = {doc.doc_type for doc in documents}
+    docs_by_type: dict[DocType, list[ParsedDocument]] = {}
+    for doc in documents:
+        docs_by_type.setdefault(doc.doc_type, []).append(doc)
 
     for doc in documents:
-        # ── 1. Check broken references in links_to ──────────────────────────
+        # ── 1. Broken references in links_to ────────────────────────────────
         for linked_id in doc.links_to:
-            if linked_id not in all_doc_ids:
-                issues.append(_make_issue(
+            if linked_id not in doc_map:
+                issues.append(make_issue(
                     IssueType.BROKEN_REFERENCE,
                     IssueSeverity.HIGH,
                     doc.doc_id,
@@ -63,44 +76,36 @@ def validate_structural(
                     target_doc=linked_id,
                 ))
 
-        # ── 2. Check version consistency ────────────────────────────────────
-        for linked_id in doc.links_to:
-            if linked_id in doc_map:
-                linked_doc = doc_map[linked_id]
-                # Flag if doc explicitly references an older version (in raw content)
-                version_hint = f"v{linked_doc.version}"
-                if version_hint in doc.raw_content:
-                    pass  # version is mentioned, that's fine
-                # Check if SDD links to old BRD version (seeded conflict)
-                if (
-                    doc.doc_type == DocType.SDD
-                    and linked_doc.doc_type == DocType.BRD
-                ):
-                    # Extract version referenced in SDD raw content
-                    import re
-                    brd_ref = re.search(
-                        r"BRD[- ]v?(\d+\.\d+)", doc.raw_content, re.IGNORECASE
-                    )
-                    if brd_ref:
-                        ref_version = brd_ref.group(1)
-                        if ref_version != linked_doc.version:
-                            issues.append(_make_issue(
-                                IssueType.VERSION_MISMATCH,
-                                IssueSeverity.MEDIUM,
-                                doc.doc_id,
-                                f"Version mismatch: {doc.doc_id} references "
-                                f"BRD v{ref_version} but current is v{linked_doc.version}",
-                                f"The SDD was written against BRD v{ref_version}. "
-                                f"The BRD has since been updated to v{linked_doc.version}. "
-                                f"Review SDD sections for outdated assumptions.",
-                                target_doc=linked_doc.doc_id,
-                            ))
+        # ── 2. Version references in the text ("written against BRD v1.0") ─
+        reported = set()
+        for name, ref_version in VERSION_REF.findall(doc.raw_content):
+            if name in doc_map:
+                target = doc_map[name]
+            elif name in DOC_TYPE_NAMES and len(docs_by_type.get(DocType(name), [])) == 1:
+                target = docs_by_type[DocType(name)][0]
+            else:
+                continue  # unknown name, or ambiguous type with several documents
+            if target.doc_id == doc.doc_id or (target.doc_id, ref_version) in reported:
+                continue
+            reported.add((target.doc_id, ref_version))
+            if _version_key(ref_version) != _version_key(target.version):
+                issues.append(make_issue(
+                    IssueType.VERSION_MISMATCH,
+                    IssueSeverity.MEDIUM,
+                    doc.doc_id,
+                    f"Version mismatch: {doc.doc_id} references "
+                    f"{target.doc_id} v{ref_version} but current is v{target.version}",
+                    f"'{doc.doc_id}' was written against {target.doc_id} "
+                    f"v{ref_version}. {target.doc_id} is now v{target.version}. "
+                    f"Review '{doc.doc_id}' for outdated assumptions.",
+                    target_doc=target.doc_id,
+                ))
 
-        # ── 3. Check User Stories have Acceptance Criteria ──────────────────
+        # ── 3. User Stories have Acceptance Criteria ────────────────────────
         if doc.doc_type == DocType.USER_STORY:
             for req in doc.requirements:
                 if not req.acceptance_criteria:
-                    issues.append(_make_issue(
+                    issues.append(make_issue(
                         IssueType.MISSING_ACCEPTANCE_CRITERIA,
                         IssueSeverity.MEDIUM,
                         doc.doc_id,
@@ -111,83 +116,90 @@ def validate_structural(
                         source_req=req.req_id,
                     ))
 
-        # ── 4. Check Epic → User Story coverage ─────────────────────────────
-        if doc.doc_type == DocType.EPIC:
-            has_user_stories = any(
-                d.doc_type == DocType.USER_STORY and doc.doc_id in d.links_to
-                for d in documents
-            )
-            if not has_user_stories:
-                issues.append(_make_issue(
+        # ── 4. Missing downstream documents (direct links_to edges) ─────────
+        for expected in REQUIRED_LINKS.get(doc.doc_type, []):
+            if expected.value not in _downstream_doc_types(G, doc.doc_id, "links_to"):
+                issues.append(make_issue(
                     IssueType.COVERAGE_GAP,
-                    IssueSeverity.HIGH,
+                    IssueSeverity.HIGH if doc.doc_type == DocType.EPIC else IssueSeverity.MEDIUM,
                     doc.doc_id,
-                    f"Epic with no User Stories: {doc.doc_id}",
-                    f"Epic '{doc.doc_id}' has no User Stories linked to it. "
-                    f"Epic objectives cannot be tracked or delivered.",
+                    f"Missing downstream: {doc.doc_id} has no {expected.value}",
+                    f"Document '{doc.doc_id}' ({doc.doc_type.value}) is expected "
+                    f"to link to a downstream {expected.value} document, but "
+                    f"none is linked.",
                 ))
 
-        # ── 5. Check PRD features have corresponding Epics ──────────────────
-        if doc.doc_type == DocType.PRD:
-            epic_docs = [d for d in documents if d.doc_type == DocType.EPIC]
+        # ── 5. Requirement-level coverage (every BRD req → CDD + PRD, ...) ──
+        for expected, issue_type, severity, consequence in REQUIRED_TRACE_COVERAGE.get(doc.doc_type, []):
+            if expected not in uploaded_types:
+                continue  # whole document missing; check 4 already reports it
             for req in doc.requirements:
-                req_node = f"{doc.doc_id}/{req.req_id}"
-                # Check if any epic traces back to this PRD requirement
-                covered = any(
-                    req_node in (r.traces_to or [])
-                    or doc.doc_id in (epic.links_to or [])
-                    for epic in epic_docs
-                    for r in epic.requirements
-                )
-                # Simpler check: does any Epic link to this PRD?
-                epic_covers_prd = any(
-                    doc.doc_id in epic.links_to for epic in epic_docs
-                )
-                if not epic_covers_prd and req.req_id == "F-04":
-                    # Seeded conflict: F-04 has no Epic
-                    issues.append(_make_issue(
-                        IssueType.ORPHANED_REQUIREMENT,
-                        IssueSeverity.HIGH,
+                node = f"{doc.doc_id}/{req.req_id}"
+                if expected.value not in _downstream_doc_types(G, node, "traces_to"):
+                    issues.append(make_issue(
+                        issue_type,
+                        severity,
                         doc.doc_id,
-                        f"PRD feature with no Epic: {doc.doc_id}/{req.req_id}",
-                        f"PRD requirement '{req.req_id}' ({req.title}) has no "
-                        f"corresponding Epic in the Jira tracking items. "
-                        f"This feature will not be tracked or delivered.",
+                        f"{doc.doc_type.value} requirement with no {expected.value}: {node}",
+                        f"No {expected.value} requirement traces to '{req.req_id}' "
+                        f"({req.title}). {consequence}",
                         source_req=req.req_id,
                     ))
+
+    # ── 6. Broken traces_to (target was never uploaded → ghost node) ─────────
+    for doc in documents:
+        for req in doc.requirements:
+            source_node = f"{doc.doc_id}/{req.req_id}"
+            for trace in req.traces_to:
+                if G.nodes[trace].get("node_type") is None:
+                    issues.append(make_issue(
+                        IssueType.BROKEN_REFERENCE,
+                        IssueSeverity.HIGH,
+                        doc.doc_id,
+                        f"Broken trace: {source_node} → {trace}",
+                        f"Requirement '{req.req_id}' in '{doc.doc_id}' traces to "
+                        f"'{trace}', but that node does not exist in the "
+                        f"traceability graph.",
+                        source_req=req.req_id,
+                        target_doc=trace.split("/")[0],
+                    ))
+
+    # ── 7. Cycles (only possible between same-rank or unknown documents) ─────
+    try:
+        cycle = nx.find_cycle(G)
+    except nx.NetworkXNoCycle:
+        cycle = None
+    if cycle:
+        path = " → ".join([u for u, _ in cycle] + [cycle[0][0]])
+        issues.append(make_issue(
+            IssueType.CIRCULAR_TRACE,
+            IssueSeverity.LOW,
+            cycle[0][0].split("/")[0],
+            "Circular traceability chain",
+            f"These items trace to each other in a loop: {path}. Impact "
+            f"analysis treats every item in the loop as affecting the others.",
+        ))
 
     return issues
 
 
 def get_semantic_pairs(
     documents: list[ParsedDocument],
-) -> list[tuple[str, str, str, str]]:
+    G: nx.DiGraph,
+) -> list[tuple[str, Requirement, str, Requirement]]:
     """
-    Return pairs of (doc_id_a, req_id_a, doc_id_b, content_b)
-    that should be checked for semantic consistency by the AI.
-    Focus on high-value cross-document pairs only.
+    Return (upstream_doc_id, upstream_req, downstream_doc_id, downstream_req)
+    for every traces_to edge between two existing requirements.
+    Reading the edges of the graph means a trace declared by both sides is
+    checked once, not twice.
     """
+    req_map = {
+        f"{doc.doc_id}/{req.req_id}": (doc.doc_id, req)
+        for doc in documents
+        for req in doc.requirements
+    }
     pairs = []
-    doc_map = {doc.doc_id: doc for doc in documents}
-
-    for doc in documents:
-        for req in doc.requirements:
-            for trace in req.traces_to:
-                # trace format: "DOC-001/R-01"
-                parts = trace.split("/")
-                if len(parts) == 2:
-                    target_doc_id, target_req_id = parts
-                    if target_doc_id in doc_map:
-                        target_doc = doc_map[target_doc_id]
-                        target_reqs = {
-                            r.req_id: r for r in target_doc.requirements
-                        }
-                        if target_req_id in target_reqs:
-                            pairs.append((
-                                doc.doc_id,
-                                req,
-                                target_doc_id,
-                                target_reqs[target_req_id],
-                            ))
-
+    for u, v, data in sorted(G.edges(data=True), key=lambda e: (e[0], e[1])):
+        if data.get("edge_type") == "traces_to" and u in req_map and v in req_map:
+            pairs.append((*req_map[u], *req_map[v]))
     return pairs

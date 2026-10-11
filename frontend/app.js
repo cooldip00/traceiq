@@ -110,7 +110,7 @@ function renderFileList() {
     return `
       <li>
         <span class="file-type-tag" style="${tagStyle}">${docType}</span>
-        ${f.name}
+        ${escHtml(f.name)}
         <span style="margin-left:auto;color:var(--text-muted);font-size:10px;">${(f.size/1024).toFixed(1)}kb</span>
       </li>
     `;
@@ -138,18 +138,16 @@ runBtn.addEventListener('click', async () => {
   let jobId;
   try {
     const resp = await fetch('/analyze', { method: 'POST', body: formData });
-    if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || `Upload failed: ${resp.status}`);
+    }
     const data = await resp.json();
     jobId = data.job_id;
     currentJobId = jobId;
   } catch (err) {
     alert('Failed to start analysis: ' + err.message);
-    runBtn.disabled = false;
-    runBtn.innerHTML = `
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <polygon points="5 3 19 12 5 21 5 3"/>
-      </svg>
-      Run Traceability Analysis`;
+    resetRunButton();
     return;
   }
 
@@ -162,20 +160,12 @@ runBtn.addEventListener('click', async () => {
 
     if (data.type === 'done') {
       eventSource.close();
-      // Fetch final report
-      await loadReport(jobId);
-      runBtn.disabled = false;
-      runBtn.innerHTML = `
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polygon points="5 3 19 12 5 21 5 3"/>
-        </svg>
-        Run Traceability Analysis`;
-      return;
-    }
-
-    if (data.type === 'error') {
-      eventSource.close();
-      console.error('Pipeline error:', data.message);
+      if (data.report_ready) {
+        await loadReport(jobId);
+      } else {
+        showFailure('The analysis failed before a report was produced. See the pipeline step marked with ✕ for details.');
+      }
+      resetRunButton();
       return;
     }
 
@@ -184,9 +174,19 @@ runBtn.addEventListener('click', async () => {
 
   eventSource.onerror = () => {
     eventSource.close();
-    console.error('SSE connection lost');
+    showFailure('Lost connection to the server. Is the backend still running?');
+    resetRunButton();
   };
 });
+
+function resetRunButton() {
+  runBtn.disabled = selectedFiles.length === 0;
+  runBtn.innerHTML = `
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <polygon points="5 3 19 12 5 21 5 3"/>
+    </svg>
+    Run Traceability Analysis`;
+}
 
 // ── PIPELINE UI ──────────────────────────────────────────────────────────────
 function resetPipeline() {
@@ -262,8 +262,24 @@ async function loadReport(jobId) {
     renderReport(report);
   } catch (err) {
     console.error('Failed to load report:', err);
+    showFailure('The report could not be loaded: ' + err.message);
   }
 }
+
+function showFailure(message) {
+  reportSection.style.display = 'block';
+  document.getElementById('report-stats').innerHTML = '';
+  document.getElementById('report-summary').textContent = message;
+  document.getElementById('ai-notice').style.display = 'none';
+  for (const id of ['report-conflicts', 'report-warnings', 'report-impact']) {
+    document.getElementById(id).innerHTML = '';
+  }
+}
+
+const AI_NOTICES = {
+  unavailable: (r) => `⚠️ AI semantic analysis did not run. ${r.pairs_total} traced requirement pair(s) were not checked for contradictions. Start Ollama and run again.`,
+  partial: (r) => `⚠️ AI analysis failed for ${r.pairs_failed} of ${r.pairs_total} pair(s). Those pairs were not checked.`,
+};
 
 function renderReport(report) {
   reportSection.style.display = 'block';
@@ -273,10 +289,15 @@ function renderReport(report) {
   document.getElementById('report-stats').innerHTML = `
     <div class="stat-pill conflict">🔴 ${report.conflicts.length} Conflicts</div>
     <div class="stat-pill warning">🟡 ${report.warnings.length} Warnings</div>
-    <div class="stat-pill ok">🟢 ${report.ok_count} Consistent</div>
+    <div class="stat-pill ok" title="AI-checked requirement pairs judged consistent">🟢 ${report.ok_count}/${report.pairs_total} Pairs consistent</div>
   `;
 
   document.getElementById('report-summary').textContent = report.summary;
+
+  const notice = document.getElementById('ai-notice');
+  const noticeText = AI_NOTICES[report.ai_status];
+  notice.style.display = noticeText ? 'block' : 'none';
+  notice.textContent = noticeText ? noticeText(report) : '';
 
   // Update tab labels
   document.getElementById('tab-conflicts').textContent = `🔴 Conflicts (${report.conflicts.length})`;
@@ -285,8 +306,36 @@ function renderReport(report) {
   // Render issues
   renderIssues('report-conflicts', report.conflicts, 'conflict');
   renderIssues('report-warnings',  report.warnings,  'warning');
+  renderImpact(report.impact_map || {});
 
   showTab(activeTab);
+}
+
+function renderImpact(impactMap) {
+  const container = document.getElementById('report-impact');
+  const rows = Object.entries(impactMap)
+    .sort((a, b) => b[1].total_impacted - a[1].total_impacted || a[0].localeCompare(b[0]));
+
+  if (rows.length === 0) {
+    container.innerHTML = '<div class="empty-state">No documents to analyze.</div>';
+    return;
+  }
+
+  container.innerHTML = `
+    <table class="impact-table">
+      <thead>
+        <tr><th>If this changes…</th><th>Docs to review</th><th>Downstream documents</th><th>Depends on</th></tr>
+      </thead>
+      <tbody>
+        ${rows.map(([docId, imp]) => `
+          <tr>
+            <td>${escHtml(docId)}</td>
+            <td class="impact-count">${imp.total_impacted}</td>
+            <td class="impact-docs">${escHtml(imp.downstream_docs.join(', ')) || '—'}</td>
+            <td class="impact-docs">${escHtml(imp.upstream_docs.join(', ')) || '—'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
 }
 
 function renderIssues(containerId, issues, type) {
@@ -316,18 +365,18 @@ function renderIssues(containerId, issues, type) {
       <div class="issue-ai-reason">${escHtml(issue.ai_reason)}</div>` : '';
 
     const meta = [
-      issue.source_doc && `<span class="issue-meta-tag">📄 ${issue.source_doc}</span>`,
-      issue.source_req && `<span class="issue-meta-tag">${issue.source_req}</span>`,
-      issue.target_doc && `<span class="issue-meta-tag">→ ${issue.target_doc}</span>`,
-      issue.target_req && `<span class="issue-meta-tag">${issue.target_req}</span>`,
-      `<span class="issue-meta-tag">${issue.severity}</span>`,
+      issue.source_doc && `<span class="issue-meta-tag">📄 ${escHtml(issue.source_doc)}</span>`,
+      issue.source_req && `<span class="issue-meta-tag">${escHtml(issue.source_req)}</span>`,
+      issue.target_doc && `<span class="issue-meta-tag">→ ${escHtml(issue.target_doc)}</span>`,
+      issue.target_req && `<span class="issue-meta-tag">${escHtml(issue.target_req)}</span>`,
+      `<span class="issue-meta-tag">${escHtml(issue.severity)}</span>`,
     ].filter(Boolean).join('');
 
     return `
       <div class="issue-card ${type}">
         <div class="issue-header">
           <div class="issue-title">${escHtml(issue.title)}</div>
-          <span class="issue-type-badge ${issue.issue_type}">${formatIssueType(issue.issue_type)}</span>
+          <span class="issue-type-badge ${escHtml(issue.issue_type)}">${escHtml(formatIssueType(issue.issue_type))}</span>
         </div>
         <div class="issue-description">${escHtml(issue.description)}</div>
         ${aiReason}
@@ -340,22 +389,26 @@ function renderIssues(containerId, issues, type) {
 
 window.showTab = function(tab) {
   activeTab = tab;
-  document.getElementById('tab-conflicts').classList.toggle('active', tab === 'conflicts');
-  document.getElementById('tab-warnings').classList.toggle('active', tab === 'warnings');
-  document.getElementById('report-conflicts').style.display = tab === 'conflicts' ? 'flex' : 'none';
-  document.getElementById('report-warnings').style.display  = tab === 'warnings'  ? 'flex' : 'none';
+  for (const name of ['conflicts', 'warnings', 'impact']) {
+    document.getElementById(`tab-${name}`).classList.toggle('active', tab === name);
+    document.getElementById(`report-${name}`).style.display = tab === name ? 'flex' : 'none';
+  }
 };
 
 // ── HELPERS ──────────────────────────────────────────────────────────────────
-function escHtml(str) {
-  if (!str) return '';
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function escHtml(value) {
+  if (value == null) return '';
+  return String(value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function formatIssueType(type) {
   const map = {
     SEMANTIC_CONFLICT: 'Semantic Conflict',
-    MISSING_LINK: 'Missing Link',
+    PARTIAL_MATCH: 'Partial Match',
+    CIRCULAR_TRACE: 'Circular Trace',
+    PARSE_ERROR: 'Parse Error',
     ORPHANED_REQUIREMENT: 'Orphaned Req',
     MISSING_ACCEPTANCE_CRITERIA: 'No AC',
     BROKEN_REFERENCE: 'Broken Ref',
