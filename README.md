@@ -25,7 +25,7 @@ Upload your PDM documents. TraceIQ runs a 5-step pipeline that:
 1. **Parses** all markdown documents and extracts structured requirements
 2. **Builds** a directed traceability graph (NetworkX) across the full document chain
 3. **Validates** structural integrity — broken links, requirement-level coverage gaps, version mismatches, requirements with no acceptance criteria
-4. **Analyzes** every traced requirement pair using a local Qwen 2.5 7B model — detecting contradictions, scope drift, and SLA mismatches
+4. **Analyzes** every traced requirement pair using a local Qwen 2.5 7B model — flagging possible contradictions and scope drift for review (see [AI accuracy](#ai-accuracy-measured-qwen257b))
 5. **Generates** a classified conflict report plus a change-impact table, streamed live to the browser via Server-Sent Events
 
 All inference runs on local GPU via Ollama. **No API keys. No cloud. No data exposure.**
@@ -53,7 +53,7 @@ ADD (Architecture Assess)                          ▼
 
 | Type | Detected By | Example |
 |---|---|---|
-| Semantic contradiction | Qwen 2.5 7B | BRD: "email within 2 min" vs US: "within 60 min" |
+| Semantic contradiction | Qwen 2.5 7B | BRD: "redeem from 100 points" vs PRD: "only from 500 points" |
 | Partial match | Qwen 2.5 7B | Downstream requirement narrower than upstream |
 | Orphaned requirement | Python (graph) | PRD feature that no Epic traces to |
 | Coverage gap | Python (graph) | BRD requirement with no CDD or PRD requirement tracing to it |
@@ -139,8 +139,26 @@ Open **http://localhost:8000** in your browser.
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest            # fast, no Ollama needed (the model is mocked)
-python -m tests.eval_ai     # precision/recall of the real model on labelled pairs (needs Ollama)
+python -m tests.eval_ai     # score the real model on hand-labelled pairs (needs Ollama)
 ```
+
+### AI accuracy (measured, qwen2.5:7b)
+
+`tests/eval_ai.py` has two hand-labelled suites. The synthetic one asks "can the model spot a
+contradiction at all?". The sample one runs the 34 real traced pairs from `sample_docs/` and asks
+"how noisy is it on real documents?".
+
+| Suite | Conflict precision | Conflict recall | False alarms | Exact match |
+|---|---|---|---|---|
+| Synthetic (12 short pairs) | 1.00 | 0.83 | 0 / 6 | 11 / 12 |
+| Sample docs (34 real pairs) | 0.00 | 0.00 | 9 / 31 | 23 / 34 |
+
+On short, clear-cut pairs the model does well. On real documents it is weak: it labels the
+seeded SLA conflict as a **partial match** rather than a conflict, and flags 9 consistent pairs as
+partial matches. It struggles to tell "covers only part of the upstream requirement" (normal, since one
+upstream requirement is usually split across several downstream ones) from "contradicts it".
+Treat AI findings as review hints, not verdicts. The structural checks are deterministic and catch
+their seeded conflicts every time.
 
 ---
 
@@ -157,7 +175,7 @@ The `sample_docs/` directory contains a complete fictional **Customer Loyalty Pr
 
 | Seeded conflict | Detected by |
 |---|---|
-| BRD R-03 (email in 2 min) vs US-002 AC-04 (60 min) | AI |
+| BRD R-03 (email in 2 min) vs US-002 AC-04 (60 min) | AI: currently flagged as a MEDIUM *partial match*, not a conflict (see AI accuracy) |
 | BRD R-07 not covered by any CDD requirement | Requirement coverage check |
 | PRD F-04 has no Epic | Requirement coverage check |
 | SDD written against BRD v1.0 (current v1.2) | Version check |
