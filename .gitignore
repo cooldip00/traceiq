@@ -39,3 +39,6 @@ mermaid-diagram-*.png
 
 # Test cache
 .pytest_cache/
+
+# Personal study notes (not published)
+docs/study/
